@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"regexp"
 	"strings"
 	"time"
 
@@ -39,7 +40,6 @@ func (s *ONVIFServer) Start(ctx context.Context) error {
 	core.Logger.Info().Msgf("ONVIF Local Network advertising address chosen: %s", localIP)
 
 	for idx, cam := range cameras {
-		// Clean camera name to avoid Polish letters and spaces which crash hardware screens!
 		cleanName := cleanCameraName(cam.DeviceName)
 
 		hdToken := fmt.Sprintf("profile_%s_hd", cam.DeviceID)
@@ -50,7 +50,7 @@ func (s *ONVIFServer) Start(ctx context.Context) error {
 				Token:      fmt.Sprintf("source_%d", idx),
 				Name:       cleanName + " Source",
 				Resolution: onvifsrv.Resolution{Width: 1920, Height: 1080},
-				Framerate:  20, // Lower framerate helper for intercom stability
+				Framerate:  20,
 			},
 			VideoEncoder: onvifsrv.VideoEncoderConfig{
 				Encoding:   "H264",
@@ -69,7 +69,7 @@ func (s *ONVIFServer) Start(ctx context.Context) error {
 			VideoSource: onvifsrv.VideoSourceConfig{
 				Token:      fmt.Sprintf("source_sd_%d", idx),
 				Name:       cleanName + " SD Source",
-				Resolution: onvifsrv.Resolution{Width: 640, Height: 480}, // VGA is highly compatible with Force Piano!
+				Resolution: onvifsrv.Resolution{Width: 640, Height: 480},
 				Framerate:  15,
 			},
 			VideoEncoder: onvifsrv.VideoEncoderConfig{
@@ -77,7 +77,7 @@ func (s *ONVIFServer) Start(ctx context.Context) error {
 				Resolution: onvifsrv.Resolution{Width: 640, Height: 480},
 				Quality:    70,
 				Framerate:  15,
-				Bitrate:    512, // Minimal footprint
+				Bitrate:    512,
 				GovLength:  15,
 			},
 		})
@@ -88,7 +88,7 @@ func (s *ONVIFServer) Start(ctx context.Context) error {
 		Port:     s.port,
 		BasePath: "/onvif",
 		Timeout:  30 * time.Second,
-		Username: "admin", // Standard credentials manually requested on add IP camera forms!
+		Username: "admin",
 		Password: "admin",
 		DeviceInfo: onvifsrv.DeviceInfo{
 			Manufacturer:    "Tuya-IPC-Terminal",
@@ -125,10 +125,94 @@ func (s *ONVIFServer) Start(ctx context.Context) error {
 		}
 	}()
 
+	// Spawn our custom WS-Discovery responder on the network!
+	go s.startWSDiscovery(ctx, localIP)
+
 	return nil
 }
 
-// Replaces spaces and Polish characters which cause wideodomofony parsing to drop or fail
+func (s *ONVIFServer) startWSDiscovery(ctx context.Context, localIP string) {
+	addr, err := net.ResolveUDPAddr("udp4", "239.255.255.250:3702")
+	if err != nil {
+		core.Logger.Error().Err(err).Msg("ONVIF Discovery: Failed to resolve WS-Discovery address")
+		return
+	}
+
+	conn, err := net.ListenMulticastUDP("udp4", nil, addr)
+	if err != nil {
+		core.Logger.Error().Err(err).Msg("ONVIF Discovery: Failed to bind WS-Discovery multicast receiver")
+		return
+	}
+	defer conn.Close()
+
+	core.Logger.Info().Msg("ONVIF Discovery: Multicast WS-Discovery Listener is active on [239.255.255.250:3702]")
+
+	buf := make([]byte, 8192)
+	messageIDRegexp := regexp.MustCompile(`(?i)<[^:>]*:?MessageID[^>]*>uuid:([^<]+)</[^:>]*:?MessageID>`)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+			n, src, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				continue
+			}
+
+			payload := string(buf[:n])
+			// Match only WS-Discovery Probe targets
+			if strings.Contains(payload, "Probe") && (strings.Contains(payload, "NetworkVideoTransmitter") || strings.Contains(payload, "Device")) {
+				core.Logger.Info().Msgf("ONVIF Discovery: Received Probe from %s", src.String())
+
+				// Extract MessageID to use as RelatesTo in reply
+				match := messageIDRegexp.FindStringSubmatch(payload)
+				messageUUID := "unspecified-uuid"
+				if len(match) > 1 {
+					messageUUID = match[1]
+				}
+
+				// Build correct SOAP payload pointing to our service
+				replyPayload := buildProbeMatchesEnvelope(messageUUID, localIP, s.port)
+
+				// Unicast reply back immediately to the sender's active IP and port!
+				replyConn, err := net.DialUDP("udp4", nil, src)
+				if err == nil {
+					_, _ = replyConn.Write([]byte(replyPayload))
+					_ = replyConn.Close()
+					core.Logger.Info().Msgf("ONVIF Discovery: Replied ProbeMatches to %s (RelatesTo: %s)", src.String(), messageUUID)
+				}
+			}
+		}
+	}
+}
+
+func buildProbeMatchesEnvelope(messageUUID, localIP string, port int) string {
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wsd="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:dn="http://www.onvif.org/ver10/network/wsdl">
+  <SOAP-ENV:Header>
+    <wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/ProbeMatches</wsa:Action>
+    <wsa:MessageID>uuid:random-server-response-%d</wsa:MessageID>
+    <wsa:RelatesTo>uuid:%s</wsa:RelatesTo>
+    <wsa:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:To>
+  </SOAP-ENV:Header>
+  <SOAP-ENV:Body>
+    <wsd:ProbeMatches>
+      <wsd:ProbeMatch>
+        <wsa:EndpointReference>
+          <wsa:Address>urn:uuid:tuya-onvif-bridge-%s</wsa:Address>
+        </wsa:EndpointReference>
+        <wsd:Types>dn:NetworkVideoTransmitter</wsd:Types>
+        <wsd:Scopes>onvif://www.onvif.org/type/NetworkVideoTransmitter onvif://www.onvif.org/name/TuyaBridge onvif://www.onvif.org/hardware/Gateway</wsd:Scopes>
+        <wsd:XAddrs>http://%s:%d/onvif/device_service</wsd:XAddrs>
+        <wsd:MetadataVersion>1</wsd:MetadataVersion>
+      </wsd:ProbeMatch>
+    </wsd:ProbeMatches>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>`, time.Now().UnixNano(), messageUUID, localIP, localIP, port)
+}
+
 func cleanCameraName(name string) string {
 	r := strings.NewReplacer(
 		" ", "_",
@@ -144,12 +228,10 @@ func getLocalIP() string {
 		return "127.0.0.1"
 	}
 	
-	// Prioritize traditional local home network IPs (192.168.x.x, 10.x.x.x but not docker/virtual bridge ranges)
 	for _, address := range addrs {
 		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ip := ipnet.IP.To4(); ip != nil {
 				ipStr := ip.String()
-				// Exclude Docker virtual networks, local ranges of virtual machines (like 172.17.x.x etc.)
 				if strings.HasPrefix(ipStr, "192.168.") || (strings.HasPrefix(ipStr, "10.") && !strings.HasPrefix(ipStr, "10.255.")) {
 					return ipStr
 				}
@@ -157,7 +239,6 @@ func getLocalIP() string {
 		}
 	}
 	
-	// Fallback to any real non-loopback IPv4 address
 	for _, address := range addrs {
 		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ip := ipnet.IP.To4(); ip != nil {
