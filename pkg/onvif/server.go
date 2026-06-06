@@ -162,6 +162,17 @@ func (s *ONVIFServer) startSanitizingProxy(ctx context.Context, localIP string) 
 
 		// NORMALIZE XML: Strip namespaces/prefixes to prevent Go's xml.Unmarshal from failing on legacy gSOAP structures!
 		normalizedBody := normalizeSOAPEnvelope(rawBody)
+		core.Logger.Debug().Msgf("ONVIF Proxy: Normalized XML envelope:\n%s", normalizedBody)
+
+		// HANDLE empty-element requests that onvif-go can't process properly
+		// These need direct responses to avoid 400 errors
+		if strings.Contains(normalizedBody, "<GetSystemDateAndTime/>") {
+			respBody := buildSystemDateAndTimeResponse()
+			w.Header().Set("Content-Type", "application/soap+xml; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(respBody))
+			return
+		}
 
 		// Create target request to internal ONVIF server
 		targetURL := fmt.Sprintf("http://127.0.0.1:8081%s", r.URL.Path)
@@ -458,6 +469,34 @@ func normalizeSOAPEnvelope(xmlData string) string {
 	xmlData = regexp.MustCompile(`<([A-Za-z]+)></\1>`).ReplaceAllString(xmlData, "<$1/>")
 
 	return xmlData
+}
+
+// buildSystemDateAndTimeResponse returns a valid ONVIF GetSystemDateAndTime response
+func buildSystemDateAndTimeResponse() string {
+	now := time.Now().UTC()
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope">
+  <Header/>
+  <Body>
+    <GetSystemDateAndTimeResponse xmlns="http://www.onvif.org/ver10/device/wsdl">
+      <SystemDateAndTime>
+        <DateTimeType>DateTime</DateTimeType>
+        <UtcDateTime>
+          <Date><Year>%d</Year><Month>%d</Month><Day>%d</Day></Date>
+          <Time><Hour>%d</Hour><Minute>%d</Minute><Second>%d</Second></Time>
+        </UtcDateTime>
+        <LocalDateTime>
+          <Date><Year>%d</Year><Month>%d</Month><Day>%d</Day></Date>
+          <Time><Hour>%d</Hour><Minute>%d</Minute><Second>%d</Second></Time>
+        </LocalDateTime>
+        <DaylightSavings>false</DaylightSavings>
+        <DaylightSavingsOffset>PT0H</DaylightSavingsOffset>
+      </SystemDateAndTime>
+    </GetSystemDateAndTimeResponse>
+  </Body>
+</Envelope>`,
+		now.Year(), int(now.Month()), now.Day(), now.Hour(), now.Minute(), now.Second(),
+		now.Year(), int(now.Month()), now.Day(), now.Hour(), now.Minute(), now.Second())
 }
 
 func getLocalIP() string {
