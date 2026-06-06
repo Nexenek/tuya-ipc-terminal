@@ -1,6 +1,7 @@
 package rtsp
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"tuya-ipc-terminal/pkg/core"
+	"tuya-ipc-terminal/pkg/onvif"
 	"tuya-ipc-terminal/pkg/rtsp"
 	"tuya-ipc-terminal/pkg/storage"
 )
@@ -25,8 +27,8 @@ func SetStorageManager(sm *storage.StorageManager) {
 func NewRTSPCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "rtsp",
-		Short: "Manage RTSP server",
-		Long:  "Commands to start, stop, and manage the RTSP server for camera streaming.",
+		Short: "Manage RTSP and ONVIF servers",
+		Long:  "Commands to start, stop, and manage the RTSP and ONVIF server for camera streaming.",
 	}
 
 	cmd.AddCommand(newStartCmd())
@@ -40,13 +42,15 @@ func NewRTSPCmd() *cobra.Command {
 func newStartCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "start",
-		Short: "Start RTSP server",
-		Long:  "Start the RTSP server to provide camera streams.",
+		Short: "Start RTSP/ONVIF server",
+		Long:  "Start the RTSP and (optional) ONVIF server to provide camera streams.",
 		RunE:  runStartServer,
 	}
 
 	cmd.Flags().IntP("port", "p", 8554, "RTSP server port")
 	cmd.Flags().BoolP("daemon", "d", false, "Run as daemon (background)")
+	cmd.Flags().Bool("onvif", true, "Enable ONVIF Profiles bridge")
+	cmd.Flags().Int("onvif-port", 8080, "ONVIF server port")
 
 	return cmd
 }
@@ -121,6 +125,20 @@ func runStartServer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to start RTSP server: %v", err)
 	}
 
+	// Start ONVIF Server if enabled
+	onvifEnabled, _ := cmd.Flags().GetBool("onvif")
+	onvifPort, _ := cmd.Flags().GetInt("onvif-port")
+	
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if onvifEnabled {
+		onvifSrv := onvif.NewONVIFServer(onvifPort, port, storageManager)
+		if err := onvifSrv.Start(ctx); err != nil {
+			core.Logger.Error().Err(err).Msg("Failed to start ONVIF sidecar service")
+		}
+	}
+
 	if daemon {
 		core.Logger.Info().Msgf("RTSP server started in daemon mode")
 		return nil
@@ -134,9 +152,9 @@ func runStartServer(cmd *cobra.Command, args []string) error {
 
 	<-signalChan
 
-	core.Logger.Info().Msgf("Shutting down RTSP server...")
+	core.Logger.Info().Msgf("Shutting down servers...")
 	if err := rtspServer.Stop(); err != nil {
-		return fmt.Errorf("error stopping server: %v", err)
+		return fmt.Errorf("error stopping RTSP server: %v", err)
 	}
 
 	core.Logger.Info().Msgf("RTSP server stopped.")
