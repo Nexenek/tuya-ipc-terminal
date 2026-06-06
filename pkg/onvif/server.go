@@ -265,11 +265,10 @@ func (s *ONVIFServer) startWSDiscovery(ctx context.Context, localIP string) {
 		// This allows our server to share port 3702 with the blocking Windows 'dashost'/DeviceAssociationService!
 		lc := net.ListenConfig{
 			Control: func(network, address string, c syscall.RawConn) error {
-				return c.Control(func(fd uintptr) {
-					// Set SO_REUSEADDR (value 4) on Unix sockets
-					const SO_REUSEADDR = 4
-					_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, SO_REUSEADDR, 1)
+				_ = c.Control(func(fd uintptr) {
+					setSocketReuseAddr(fd)
 				})
+				return nil
 			},
 		}
 		unicastConn, err := lc.ListenPacket(ctx, "udp4", uaddr.String())
@@ -289,10 +288,10 @@ func (s *ONVIFServer) startWSDiscovery(ctx context.Context, localIP string) {
 		// Use a custom ListenConfig to enforce socket reuse (SO_REUSEADDR) on Windows fallback!
 		lc := net.ListenConfig{
 			Control: func(network, address string, c syscall.RawConn) error {
-				return c.Control(func(fd uintptr) {
-					const SO_REUSEADDR = 4
-					_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, SO_REUSEADDR, 1)
+				_ = c.Control(func(fd uintptr) {
+					setSocketReuseAddr(fd)
 				})
+				return nil
 			},
 		}
 		fallbackConn, err := lc.ListenPacket(ctx, "udp4", laddr.String())
