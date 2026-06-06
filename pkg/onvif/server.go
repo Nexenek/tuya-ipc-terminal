@@ -6,6 +6,7 @@ import (
 	"net"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	onvifsrv "github.com/0x524a/onvif-go/server"
@@ -169,11 +170,23 @@ func (s *ONVIFServer) startWSDiscovery(ctx context.Context, localIP string) {
 	// Dynamic unicast listener directly on the advertised local IP
 	uaddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:3702", localIP))
 	if err == nil {
-		unicastConn, err := net.ListenUDP("udp4", uaddr)
+		// Use a custom ListenConfig to enforce socket reuse (SO_REUSEADDR) on Windows!
+		// This allows our server to share port 3702 with the blocking Windows 'dashost'/DeviceAssociationService!
+		lc := net.ListenConfig{
+			Control: func(network, address string, c syscall.RawConn) error {
+				return c.Control(func(fd uintptr) {
+					// Set SO_REUSEADDR (value 4) on Windows / Unix sockets
+					_ = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+				})
+			},
+		}
+		unicastConn, err := lc.ListenPacket(ctx, "udp4", uaddr.String())
 		if err == nil {
 			activeListeners++
-			core.Logger.Info().Msgf("ONVIF Discovery: Direct Unicast UDP Listener is active on [%s:3702]", localIP)
-			go s.listenOnConn(ctx, unicastConn, "unicast-specific", localIP)
+			core.Logger.Info().Msgf("ONVIF Discovery: Direct Unicast UDP Listener is active on [%s:3702] (Socket shared successfully!)", localIP)
+			if udpConn, ok := unicastConn.(*net.UDPConn); ok {
+				go s.listenOnConn(ctx, udpConn, "unicast-specific", localIP)
+			}
 		} else {
 			core.Logger.Warn().Err(err).Msgf("ONVIF Discovery: Direct Unicast UDP Listener failed to bind to [%s:3702]", localIP)
 		}
@@ -181,11 +194,21 @@ func (s *ONVIFServer) startWSDiscovery(ctx context.Context, localIP string) {
 
 	laddr, err := net.ResolveUDPAddr("udp4", "0.0.0.0:3702")
 	if err == nil {
-		fallbackConn, err := net.ListenUDP("udp4", laddr)
+		// Use a custom ListenConfig to enforce socket reuse (SO_REUSEADDR) on Windows fallback!
+		lc := net.ListenConfig{
+			Control: func(network, address string, c syscall.RawConn) error {
+				return c.Control(func(fd uintptr) {
+					_ = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+				})
+			},
+		}
+		fallbackConn, err := lc.ListenPacket(ctx, "udp4", laddr.String())
 		if err == nil {
 			activeListeners++
-			core.Logger.Info().Msg("ONVIF Discovery: Fallback Wildcard UDP Listener is active on [0.0.0.0:3702]")
-			go s.listenOnConn(ctx, fallbackConn, "wildcard-fallback", localIP)
+			core.Logger.Info().Msg("ONVIF Discovery: Fallback Wildcard UDP Listener is active on [0.0.0.0:3702] (Socket shared successfully!)")
+			if udpConn, ok := fallbackConn.(*net.UDPConn); ok {
+				go s.listenOnConn(ctx, udpConn, "wildcard-fallback", localIP)
+			}
 		} else {
 			core.Logger.Warn().Err(err).Msg("ONVIF Discovery: Fallback Wildcard UDP Listener failed to bind to [0.0.0.0:3702] (Port 3702 is likely occupied by Windows WSD/SSDP services)")
 		}
