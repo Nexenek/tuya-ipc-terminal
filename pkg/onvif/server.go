@@ -146,7 +146,6 @@ func (s *ONVIFServer) startWSDiscovery(ctx context.Context, localIP string) {
 
 	activeListeners := 0
 	for _, iface := range ifaces {
-		// Bind only to non-loopback active interfaces that support multicast
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagMulticast == 0 {
 			continue
 		}
@@ -162,7 +161,6 @@ func (s *ONVIFServer) startWSDiscovery(ctx context.Context, localIP string) {
 		go s.listenOnConn(ctx, conn, iface.Name, localIP)
 	}
 
-	// Double-enforce standard wildcard fallback UDP listener
 	laddr, err := net.ResolveUDPAddr("udp4", "0.0.0.0:3702")
 	if err == nil {
 		fallbackConn, err := net.ListenUDP("udp4", laddr)
@@ -259,21 +257,27 @@ func getLocalIP() string {
 		return "127.0.0.1"
 	}
 	
+	// STEP 1: Loop and target ONLY your real active physical IP range (192.168.1.x etc.)
 	for _, address := range addrs {
 		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ip := ipnet.IP.To4(); ip != nil {
 				ipStr := ip.String()
-				if strings.HasPrefix(ipStr, "192.168.") || (strings.HasPrefix(ipStr, "10.") && !strings.HasPrefix(ipStr, "10.255.")) {
+				// Crucial Check: Ignore VirtualBox host-only default ranges (192.168.56.x)
+				if strings.HasPrefix(ipStr, "192.168.1.") || strings.HasPrefix(ipStr, "192.168.0.") || strings.HasPrefix(ipStr, "192.168.80.") {
 					return ipStr
 				}
 			}
 		}
 	}
 	
+	// STEP 2: Fallback to general generic local home subnet matching while actively skipping the VirtualBox subnet
 	for _, address := range addrs {
 		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ip := ipnet.IP.To4(); ip != nil {
-				return ip.String()
+				ipStr := ip.String()
+				if strings.HasPrefix(ipStr, "192.168.") && !strings.HasPrefix(ipStr, "192.168.56.") {
+					return ipStr
+				}
 			}
 		}
 	}
