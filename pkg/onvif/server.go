@@ -421,11 +421,10 @@ func cleanCameraName(name string) string {
 }
 
 func normalizeSOAPEnvelope(xmlData string) string {
-	// 1. Remove XML declarations if they are prefixed oddly
-	// 2. Change all forms of SOAP namespaces so encoding/xml can parse it with standard Envelope tags
+	// 1. Change all forms of SOAP namespaces so encoding/xml can parse it with standard Envelope tags
 	// Specifically, we replace custom Envelope prefixes (like <SOAP-ENV:Envelope or <s:Envelope) with standard Go envelope schema:
 	
-	// Fast path mappings
+	// Fast path mappings for standard envelope structural normalization
 	replacements := []string{
 		"<SOAP-ENV:Envelope", "<Envelope xmlns=\"http://www.w3.org/2003/05/soap-envelope\"",
 		"</SOAP-ENV:Envelope>", "</Envelope>",
@@ -449,6 +448,16 @@ func normalizeSOAPEnvelope(xmlData string) string {
 	xmlData = strings.ReplaceAll(xmlData, "SOAP-ENC:", "")
 	xmlData = strings.ReplaceAll(xmlData, "wsse:", "")
 	xmlData = strings.ReplaceAll(xmlData, "wsu:", "")
+
+	// 3. Fix Go's strict unmarshalling expected elements for namespace definitions!
+	// If a tag is like '<GetSystemDateAndTime xmlns="..."', Go's strict structure unmarshaller
+	// expects '<tds:GetSystemDateAndTime' or '<GetSystemDateAndTime xmlns="http://www.onvif.org/ver10/device/wsdl">' precisely.
+	// Since legacy clients send raw child namespace tags, we can force the correct XML namespace decoration
+	// on the standard known root message tags before they hit the unmarshaller:
+	xmlData = strings.ReplaceAll(xmlData, "<GetSystemDateAndTime>", "<GetSystemDateAndTime xmlns=\"http://www.onvif.org/ver10/device/wsdl\">")
+	xmlData = strings.ReplaceAll(xmlData, "<GetCapabilities>", "<GetCapabilities xmlns=\"http://www.onvif.org/ver10/device/wsdl\">")
+	xmlData = strings.ReplaceAll(xmlData, "<GetProfiles>", "<GetProfiles xmlns=\"http://www.onvif.org/ver10/media/wsdl\">")
+	xmlData = strings.ReplaceAll(xmlData, "<GetStreamURI>", "<GetStreamURI xmlns=\"http://www.onvif.org/ver10/media/wsdl\">")
 	
 	return xmlData
 }
