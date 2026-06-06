@@ -132,20 +132,31 @@ func (s *ONVIFServer) Start(ctx context.Context) error {
 }
 
 func (s *ONVIFServer) startWSDiscovery(ctx context.Context, localIP string) {
-	addr, err := net.ResolveUDPAddr("udp4", "239.255.255.250:3702")
+	// Bind to port 3702 on 0.0.0.0 (any network interface) to make sure we don't miss local interface broadcasts
+	laddr, err := net.ResolveUDPAddr("udp4", "0.0.0.0:3702")
 	if err != nil {
-		core.Logger.Error().Err(err).Msg("ONVIF Discovery: Failed to resolve WS-Discovery address")
+		core.Logger.Error().Err(err).Msg("ONVIF Discovery: Failed to resolve local UDP bind address")
 		return
 	}
 
-	conn, err := net.ListenMulticastUDP("udp4", nil, addr)
+	maddr, err := net.ResolveUDPAddr("udp4", "239.255.255.250:3702")
 	if err != nil {
-		core.Logger.Error().Err(err).Msg("ONVIF Discovery: Failed to bind WS-Discovery multicast receiver")
+		core.Logger.Error().Err(err).Msg("ONVIF Discovery: Failed to resolve multicast address")
 		return
+	}
+
+	conn, err := net.ListenMulticastUDP("udp4", nil, maddr)
+	if err != nil {
+		// Fallback to standard UDP listener on 3702 if multicast bind is restrictive
+		conn, err = net.ListenUDP("udp4", laddr)
+		if err != nil {
+			core.Logger.Error().Err(err).Msg("ONVIF Discovery: Failed to bind WS-Discovery receiver")
+			return
+		}
 	}
 	defer conn.Close()
 
-	core.Logger.Info().Msg("ONVIF Discovery: Multicast WS-Discovery Listener is active on [239.255.255.250:3702]")
+	core.Logger.Info().Msg("ONVIF Discovery: Multicast WS-Discovery Listener is active on [0.0.0.0:3702 -> 239.255.255.250]")
 
 	buf := make([]byte, 8192)
 	messageIDRegexp := regexp.MustCompile(`(?i)<[^:>]*:?MessageID[^>]*>uuid:([^<]+)</[^:>]*:?MessageID>`)
