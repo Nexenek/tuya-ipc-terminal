@@ -125,39 +125,61 @@ func (s *ONVIFServer) Start(ctx context.Context) error {
 		}
 	}()
 
-	// Spawn our custom WS-Discovery responder on the network!
+	// Spawn our multi-interface WS-Discovery responder!
 	go s.startWSDiscovery(ctx, localIP)
 
 	return nil
 }
 
 func (s *ONVIFServer) startWSDiscovery(ctx context.Context, localIP string) {
-	// Bind to port 3702 on 0.0.0.0 (any network interface) to make sure we don't miss local interface broadcasts
-	laddr, err := net.ResolveUDPAddr("udp4", "0.0.0.0:3702")
+	gaddr, err := net.ResolveUDPAddr("udp4", "239.255.255.250:3702")
 	if err != nil {
-		core.Logger.Error().Err(err).Msg("ONVIF Discovery: Failed to resolve local UDP bind address")
+		core.Logger.Error().Err(err).Msg("ONVIF Discovery: Failed to resolve multicast group")
 		return
 	}
 
-	maddr, err := net.ResolveUDPAddr("udp4", "239.255.255.250:3702")
+	ifaces, err := net.Interfaces()
 	if err != nil {
-		core.Logger.Error().Err(err).Msg("ONVIF Discovery: Failed to resolve multicast address")
+		core.Logger.Error().Err(err).Msg("ONVIF Discovery: Failed to list network interfaces")
 		return
 	}
 
-	conn, err := net.ListenMulticastUDP("udp4", nil, maddr)
-	if err != nil {
-		// Fallback to standard UDP listener on 3702 if multicast bind is restrictive
-		conn, err = net.ListenUDP("udp4", laddr)
+	activeListeners := 0
+	for _, iface := range ifaces {
+		// Bind only to non-loopback active interfaces that support multicast
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagMulticast == 0 {
+			continue
+		}
+
+		conn, err := net.ListenMulticastUDP("udp4", &iface, gaddr)
 		if err != nil {
-			core.Logger.Error().Err(err).Msg("ONVIF Discovery: Failed to bind WS-Discovery receiver")
-			return
+			core.Logger.Debug().Msgf("ONVIF Discovery: Multicast bind ignored on interface %s: %v", iface.Name, err)
+			continue
+		}
+
+		activeListeners++
+		core.Logger.Info().Msgf("ONVIF Discovery: Multicast WS-Discovery Listener is active on interface [%s]", iface.Name)
+		go s.listenOnConn(ctx, conn, iface.Name, localIP)
+	}
+
+	// Double-enforce standard wildcard fallback UDP listener
+	laddr, err := net.ResolveUDPAddr("udp4", "0.0.0.0:3702")
+	if err == nil {
+		fallbackConn, err := net.ListenUDP("udp4", laddr)
+		if err == nil {
+			activeListeners++
+			core.Logger.Info().Msg("ONVIF Discovery: Fallback Wildcard UDP Listener is active on [0.0.0.0:3702]")
+			go s.listenOnConn(ctx, fallbackConn, "wildcard-fallback", localIP)
 		}
 	}
+
+	if activeListeners == 0 {
+		core.Logger.Error().Msg("ONVIF Discovery: CRITICAL! No active UDP interfaces could be bound on port 3702")
+	}
+}
+
+func (s *ONVIFServer) listenOnConn(ctx context.Context, conn *net.UDPConn, ifaceName, localIP string) {
 	defer conn.Close()
-
-	core.Logger.Info().Msg("ONVIF Discovery: Multicast WS-Discovery Listener is active on [0.0.0.0:3702 -> 239.255.255.250]")
-
 	buf := make([]byte, 8192)
 	messageIDRegexp := regexp.MustCompile(`(?i)<[^:>]*:?MessageID[^>]*>uuid:([^<]+)</[^:>]*:?MessageID>`)
 
@@ -173,26 +195,24 @@ func (s *ONVIFServer) startWSDiscovery(ctx context.Context, localIP string) {
 			}
 
 			payload := string(buf[:n])
-			// Match only WS-Discovery Probe targets
 			if strings.Contains(payload, "Probe") && (strings.Contains(payload, "NetworkVideoTransmitter") || strings.Contains(payload, "Device")) {
-				core.Logger.Info().Msgf("ONVIF Discovery: Received Probe from %s", src.String())
+				core.Logger.Info().Msgf("ONVIF Discovery [%s]: Received Probe from %s", ifaceName, src.String())
 
-				// Extract MessageID to use as RelatesTo in reply
-				match := messageIDRegexp.FindStringSubmatch(payload)
 				messageUUID := "unspecified-uuid"
+				match := messageIDRegexp.FindStringSubmatch(payload)
 				if len(match) > 1 {
 					messageUUID = match[1]
 				}
 
-				// Build correct SOAP payload pointing to our service
 				replyPayload := buildProbeMatchesEnvelope(messageUUID, localIP, s.port)
 
-				// Unicast reply back immediately to the sender's active IP and port!
 				replyConn, err := net.DialUDP("udp4", nil, src)
 				if err == nil {
 					_, _ = replyConn.Write([]byte(replyPayload))
 					_ = replyConn.Close()
-					core.Logger.Info().Msgf("ONVIF Discovery: Replied ProbeMatches to %s (RelatesTo: %s)", src.String(), messageUUID)
+					core.Logger.Info().Msgf("ONVIF Discovery [%s]: Replied ProbeMatches to %s (RelatesTo: %s)", ifaceName, src.String(), messageUUID)
+				} else {
+					core.Logger.Error().Err(err).Msgf("ONVIF Discovery [%s]: Failed to unicast reply to %s", ifaceName, src.String())
 				}
 			}
 		}
