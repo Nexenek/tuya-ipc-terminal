@@ -160,9 +160,12 @@ func (s *ONVIFServer) startSanitizingProxy(ctx context.Context, localIP string) 
 		core.Logger.Debug().Msgf("ONVIF Proxy: Raw request headers: %v", r.Header)
 		core.Logger.Debug().Msgf("ONVIF Proxy: Raw XML envelope:\n%s", rawBody)
 
+		// NORMALIZE XML: Strip namespaces/prefixes to prevent Go's xml.Unmarshal from failing on legacy gSOAP structures!
+		normalizedBody := normalizeSOAPEnvelope(rawBody)
+
 		// Create target request to internal ONVIF server
 		targetURL := fmt.Sprintf("http://127.0.0.1:8081%s", r.URL.Path)
-		req, err := http.NewRequest("POST", targetURL, strings.NewReader(rawBody))
+		req, err := http.NewRequest("POST", targetURL, strings.NewReader(normalizedBody))
 		if err != nil {
 			http.Error(w, "Failed to create forward request", http.StatusInternalServerError)
 			return
@@ -415,6 +418,39 @@ func cleanCameraName(name string) string {
 		"Ą", "A", "Ć", "C", "Ę", "E", "Ł", "L", "Ń", "N", "Ó", "O", "Ś", "S", "Ź", "Z", "Ż", "Z",
 	)
 	return r.Replace(name)
+}
+
+func normalizeSOAPEnvelope(xmlData string) string {
+	// 1. Remove XML declarations if they are prefixed oddly
+	// 2. Change all forms of SOAP namespaces so encoding/xml can parse it with standard Envelope tags
+	// Specifically, we replace custom Envelope prefixes (like <SOAP-ENV:Envelope or <s:Envelope) with standard Go envelope schema:
+	
+	// Fast path mappings
+	replacements := []string{
+		"<SOAP-ENV:Envelope", "<Envelope xmlns=\"http://www.w3.org/2003/05/soap-envelope\"",
+		"</SOAP-ENV:Envelope>", "</Envelope>",
+		"<SOAP-ENV:Header", "<Header",
+		"</SOAP-ENV:Header>", "</Header>",
+		"<SOAP-ENV:Body", "<Body",
+		"</SOAP-ENV:Body>", "</Body>",
+		
+		"<s:Envelope", "<Envelope xmlns=\"http://www.w3.org/2003/05/soap-envelope\"",
+		"</s:Envelope>", "</Envelope>",
+		"<s:Header", "<Header",
+		"</s:Header>", "</Header>",
+		"<s:Body", "<Body",
+		"</s:Body>", "</Body>",
+	}
+	r := strings.NewReplacer(replacements...)
+	xmlData = r.Replace(xmlData)
+
+	// Clean nested namespace references inside SOAP tags so they decode natively
+	xmlData = strings.ReplaceAll(xmlData, "SOAP-ENV:", "")
+	xmlData = strings.ReplaceAll(xmlData, "SOAP-ENC:", "")
+	xmlData = strings.ReplaceAll(xmlData, "wsse:", "")
+	xmlData = strings.ReplaceAll(xmlData, "wsu:", "")
+	
+	return xmlData
 }
 
 func getLocalIP() string {
