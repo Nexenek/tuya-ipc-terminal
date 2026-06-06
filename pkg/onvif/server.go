@@ -119,7 +119,7 @@ func (s *ONVIFServer) Start(ctx context.Context) error {
 	for _, cam := range cameras {
 		hdToken := fmt.Sprintf("profile_%s_hd", cam.DeviceID)
 		sdToken := fmt.Sprintf("profile_%s_sd", cam.DeviceID)
-		
+
 		srv.UpdateStreamURI(hdToken, fmt.Sprintf("rtsp://%s:%d%s", localIP, s.rtspPort, cam.RTSPPath))
 		srv.UpdateStreamURI(sdToken, fmt.Sprintf("rtsp://%s:%d%s/sd", localIP, s.rtspPort, cam.RTSPPath))
 	}
@@ -266,8 +266,9 @@ func (s *ONVIFServer) startWSDiscovery(ctx context.Context, localIP string) {
 		lc := net.ListenConfig{
 			Control: func(network, address string, c syscall.RawConn) error {
 				return c.Control(func(fd uintptr) {
-					// Set SO_REUSEADDR (value 4) on Windows / Unix sockets
-					_ = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+					// Set SO_REUSEADDR (value 4) on Unix sockets
+					const SO_REUSEADDR = 4
+					_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, SO_REUSEADDR, 1)
 				})
 			},
 		}
@@ -289,7 +290,8 @@ func (s *ONVIFServer) startWSDiscovery(ctx context.Context, localIP string) {
 		lc := net.ListenConfig{
 			Control: func(network, address string, c syscall.RawConn) error {
 				return c.Control(func(fd uintptr) {
-					_ = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+					const SO_REUSEADDR = 4
+					_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, SO_REUSEADDR, 1)
 				})
 			},
 		}
@@ -327,14 +329,13 @@ func (s *ONVIFServer) listenOnConn(ctx context.Context, conn *net.UDPConn, iface
 			}
 
 			payload := string(buf[:n])
-			
+
 			// Detect both "Probe" and "Resolve" requests, and tolerate missing schema tags
 			isProbe := strings.Contains(payload, "Probe") && (strings.Contains(payload, "NetworkVideoTransmitter") || strings.Contains(payload, "Device") || strings.Contains(payload, "scopes") || len(payload) < 2000)
 			isResolve := strings.Contains(payload, "Resolve") && (strings.Contains(payload, "tuya-onvif-bridge") || strings.Contains(payload, "Device"))
 
 			if isProbe || isResolve {
 				core.Logger.Info().Msgf("ONVIF Discovery [%s]: Received Discovery Target (%s) from %s", ifaceName, map[bool]string{true: "Resolve", false: "Probe"}[isResolve], src.String())
-
 				messageUUID := "unspecified-uuid"
 				match := messageIDRegexp.FindStringSubmatch(payload)
 				if len(match) > 1 {
@@ -420,20 +421,19 @@ func cleanCameraName(name string) string {
 	return r.Replace(name)
 }
 
+// normalizeSOAPEnvelope strips problematic namespaces and normalizes empty tags
+// to ensure compatibility with Go's strict xml.Unmarshal used by onvif-go
 func normalizeSOAPEnvelope(xmlData string) string {
 	// 1. Change all forms of SOAP namespaces so encoding/xml can parse it with standard Envelope tags
-	// Specifically, we replace custom Envelope prefixes (like <SOAP-ENV:Envelope or <s:Envelope) with standard Go envelope schema:
-	
-	// Fast path mappings for standard envelope structural normalization
 	replacements := []string{
-		"<SOAP-ENV:Envelope", "<Envelope xmlns=\"http://www.w3.org/2003/05/soap-envelope\"",
+		"<SOAP-ENV:Envelope", "<Envelope xmlns=\"http://www.w3.org/2003/05/soap-envelope\">",
 		"</SOAP-ENV:Envelope>", "</Envelope>",
 		"<SOAP-ENV:Header", "<Header",
 		"</SOAP-ENV:Header>", "</Header>",
 		"<SOAP-ENV:Body", "<Body",
 		"</SOAP-ENV:Body>", "</Body>",
-		
-		"<s:Envelope", "<Envelope xmlns=\"http://www.w3.org/2003/05/soap-envelope\"",
+
+		"<s:Envelope", "<Envelope xmlns=\"http://www.w3.org/2003/05/soap-envelope\">",
 		"</s:Envelope>", "</Envelope>",
 		"<s:Header", "<Header",
 		"</s:Header>", "</Header>",
@@ -449,18 +449,15 @@ func normalizeSOAPEnvelope(xmlData string) string {
 	xmlData = strings.ReplaceAll(xmlData, "wsse:", "")
 	xmlData = strings.ReplaceAll(xmlData, "wsu:", "")
 
-	// 3. Fix Go's strict unmarshalling expected elements for namespace definitions!
-	// Some legacy gSOAP devices push local xmlns attributes on core action tags inside the body, e.g.:
-	// '<GetSystemDateAndTime xmlns="http://www.onvif.org/ver10/device/wsdl">'
-	// This namespace redeclaring inside the SOAP Body forces Go's xml.Unmarshal to fail due to context resets.
-	// We dynamically strip those localized xmlns declarations on the body tags to let them unmarshal cleanly!
-	xmlData = strings.ReplaceAll(xmlData, " xmlns=\"http://www.onvif.org/ver10/device/wsdl\"", "")
-	xmlData = strings.ReplaceAll(xmlData, " xmlns=\"http://www.onvif.org/ver10/media/wsdl\"", "")
-	
-	// Also ensure known tags are cleansed of any trailing nested attributes that reset parsing
-	xmlData = strings.ReplaceAll(xmlData, "<GetSystemDateAndTime>", "<GetSystemDateAndTime>")
-	xmlData = strings.ReplaceAll(xmlData, "<GetCapabilities>", "<GetCapabilities>")
-	
+	// 2. Strip xmlns declarations on body action tags that cause Go's xml.Unmarshal to fail
+	// Pattern: <GetSystemDateAndTime xmlns="..."> or <GetCapabilities xmlns="..." ...>
+	xmlnsPattern := regexp.MustCompile(` xmlns="http://www\.onvif\.org/ver10/(?:device|media|network)/wsdl"[^>]*>`)
+	xmlData = xmlnsPattern.ReplaceAllString(xmlData, ">")
+
+	// 3. Collapse empty tags to self-closing style (Go xml.Unmarshal prefers this)
+	// e.g., <GetSystemDateAndTime></GetSystemDateAndTime> -> <GetSystemDateAndTime/>
+	xmlData = regexp.MustCompile(`<([A-Za-z]+)></\1>`).ReplaceAllString(xmlData, "<$1/>")
+
 	return xmlData
 }
 
@@ -469,7 +466,7 @@ func getLocalIP() string {
 	if err != nil {
 		return "127.0.0.1"
 	}
-	
+
 	for _, address := range addrs {
 		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ip := ipnet.IP.To4(); ip != nil {
@@ -480,7 +477,7 @@ func getLocalIP() string {
 			}
 		}
 	}
-	
+
 	for _, address := range addrs {
 		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ip := ipnet.IP.To4(); ip != nil {
