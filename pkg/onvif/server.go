@@ -166,7 +166,8 @@ func (s *ONVIFServer) startSanitizingProxy(ctx context.Context, localIP string) 
 
 		// HANDLE empty-element requests that onvif-go can't process properly
 		// These need direct responses to avoid 400 errors
-		if strings.Contains(normalizedBody, "<GetSystemDateAndTime/>") {
+		// Check raw body for GetSystemDateAndTime since normalization may not have completed
+		if strings.Contains(rawBody, "GetSystemDateAndTime") && !strings.Contains(rawBody, "<Category>") {
 			respBody := buildSystemDateAndTimeResponse()
 			w.Header().Set("Content-Type", "application/soap+xml; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
