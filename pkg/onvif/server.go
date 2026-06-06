@@ -198,8 +198,13 @@ func (s *ONVIFServer) listenOnConn(ctx context.Context, conn *net.UDPConn, iface
 			}
 
 			payload := string(buf[:n])
-			if strings.Contains(payload, "Probe") && (strings.Contains(payload, "NetworkVideoTransmitter") || strings.Contains(payload, "Device")) {
-				core.Logger.Info().Msgf("ONVIF Discovery [%s]: Received Probe from %s", ifaceName, src.String())
+			
+			// Detect both "Probe" and "Resolve" requests
+			isProbe := strings.Contains(payload, "Probe") && (strings.Contains(payload, "NetworkVideoTransmitter") || strings.Contains(payload, "Device"))
+			isResolve := strings.Contains(payload, "Resolve") && strings.Contains(payload, "tuya-onvif-bridge")
+
+			if isProbe || isResolve {
+				core.Logger.Info().Msgf("ONVIF Discovery [%s]: Received Discovery Target (%s) from %s", ifaceName, map[bool]string{true: "Resolve", false: "Probe"}[isResolve], src.String())
 
 				messageUUID := "unspecified-uuid"
 				match := messageIDRegexp.FindStringSubmatch(payload)
@@ -207,13 +212,18 @@ func (s *ONVIFServer) listenOnConn(ctx context.Context, conn *net.UDPConn, iface
 					messageUUID = match[1]
 				}
 
-				replyPayload := buildProbeMatchesEnvelope(messageUUID, localIP, s.port)
+				var replyPayload string
+				if isResolve {
+					replyPayload = buildResolveMatchesEnvelope(messageUUID, localIP, s.port)
+				} else {
+					replyPayload = buildProbeMatchesEnvelope(messageUUID, localIP, s.port)
+				}
 
 				replyConn, err := net.DialUDP("udp4", nil, src)
 				if err == nil {
 					_, _ = replyConn.Write([]byte(replyPayload))
 					_ = replyConn.Close()
-					core.Logger.Info().Msgf("ONVIF Discovery [%s]: Replied ProbeMatches to %s (RelatesTo: %s)", ifaceName, src.String(), messageUUID)
+					core.Logger.Info().Msgf("ONVIF Discovery [%s]: Replied Response to %s (RelatesTo: %s)", ifaceName, src.String(), messageUUID)
 				} else {
 					core.Logger.Error().Err(err).Msgf("ONVIF Discovery [%s]: Failed to unicast reply to %s", ifaceName, src.String())
 				}
@@ -247,6 +257,31 @@ func buildProbeMatchesEnvelope(messageUUID, localIP string, port int) string {
 </SOAP-ENV:Envelope>`, time.Now().UnixNano(), messageUUID, localIP, localIP, port)
 }
 
+func buildResolveMatchesEnvelope(messageUUID, localIP string, port int) string {
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wsd="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:dn="http://www.onvif.org/ver10/network/wsdl">
+  <SOAP-ENV:Header>
+    <wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/ResolveMatches</wsa:Action>
+    <wsa:MessageID>uuid:random-server-resolve-response-%d</wsa:MessageID>
+    <wsa:RelatesTo>uuid:%s</wsa:RelatesTo>
+    <wsa:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:To>
+  </SOAP-ENV:Header>
+  <SOAP-ENV:Body>
+    <wsd:ResolveMatches>
+      <wsd:ResolveMatch>
+        <wsa:EndpointReference>
+          <wsa:Address>urn:uuid:tuya-onvif-bridge-%s</wsa:Address>
+        </wsa:EndpointReference>
+        <wsd:Types>dn:NetworkVideoTransmitter</wsd:Types>
+        <wsd:Scopes>onvif://www.onvif.org/type/NetworkVideoTransmitter onvif://www.onvif.org/name/TuyaBridge onvif://www.onvif.org/hardware/Gateway</wsd:Scopes>
+        <wsd:XAddrs>http://%s:%d/onvif/device_service</wsd:XAddrs>
+        <wsd:MetadataVersion>1</wsd:MetadataVersion>
+      </wsd:ResolveMatch>
+    </wsd:ResolveMatches>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>`, time.Now().UnixNano(), messageUUID, localIP, localIP, port)
+}
+
 func cleanCameraName(name string) string {
 	r := strings.NewReplacer(
 		" ", "_",
@@ -266,7 +301,7 @@ func getLocalIP() string {
 		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ip := ipnet.IP.To4(); ip != nil {
 				ipStr := ip.String()
-				if strings.HasPrefix(ipStr, "192.168.1.") || strings.HasPrefix(ipStr, "192.168.0.") || strings.HasPrefix(ipStr, "192.168.80.") {
+				if strings.HasPrefix(ipStr, "192.168.") || (strings.HasPrefix(ipStr, "10.") && !strings.HasPrefix(ipStr, "10.255.")) {
 					return ipStr
 				}
 			}
