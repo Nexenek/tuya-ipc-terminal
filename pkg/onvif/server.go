@@ -166,6 +166,19 @@ func (s *ONVIFServer) startWSDiscovery(ctx context.Context, localIP string) {
 		go s.listenOnConn(ctx, conn, iface.Name, localIP)
 	}
 
+	// Dynamic unicast listener directly on the advertised local IP
+	uaddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:3702", localIP))
+	if err == nil {
+		unicastConn, err := net.ListenUDP("udp4", uaddr)
+		if err == nil {
+			activeListeners++
+			core.Logger.Info().Msgf("ONVIF Discovery: Direct Unicast UDP Listener is active on [%s:3702]", localIP)
+			go s.listenOnConn(ctx, unicastConn, "unicast-specific", localIP)
+		} else {
+			core.Logger.Warn().Err(err).Msgf("ONVIF Discovery: Direct Unicast UDP Listener failed to bind to [%s:3702]", localIP)
+		}
+	}
+
 	laddr, err := net.ResolveUDPAddr("udp4", "0.0.0.0:3702")
 	if err == nil {
 		fallbackConn, err := net.ListenUDP("udp4", laddr)
@@ -173,6 +186,8 @@ func (s *ONVIFServer) startWSDiscovery(ctx context.Context, localIP string) {
 			activeListeners++
 			core.Logger.Info().Msg("ONVIF Discovery: Fallback Wildcard UDP Listener is active on [0.0.0.0:3702]")
 			go s.listenOnConn(ctx, fallbackConn, "wildcard-fallback", localIP)
+		} else {
+			core.Logger.Warn().Err(err).Msg("ONVIF Discovery: Fallback Wildcard UDP Listener failed to bind to [0.0.0.0:3702] (Port 3702 is likely occupied by Windows WSD/SSDP services)")
 		}
 	}
 
@@ -199,9 +214,9 @@ func (s *ONVIFServer) listenOnConn(ctx context.Context, conn *net.UDPConn, iface
 
 			payload := string(buf[:n])
 			
-			// Detect both "Probe" and "Resolve" requests
-			isProbe := strings.Contains(payload, "Probe") && (strings.Contains(payload, "NetworkVideoTransmitter") || strings.Contains(payload, "Device"))
-			isResolve := strings.Contains(payload, "Resolve") && strings.Contains(payload, "tuya-onvif-bridge")
+			// Detect both "Probe" and "Resolve" requests, and tolerate missing schema tags
+			isProbe := strings.Contains(payload, "Probe") && (strings.Contains(payload, "NetworkVideoTransmitter") || strings.Contains(payload, "Device") || strings.Contains(payload, "scopes") || len(payload) < 2000)
+			isResolve := strings.Contains(payload, "Resolve") && (strings.Contains(payload, "tuya-onvif-bridge") || strings.Contains(payload, "Device"))
 
 			if isProbe || isResolve {
 				core.Logger.Info().Msgf("ONVIF Discovery [%s]: Received Discovery Target (%s) from %s", ifaceName, map[bool]string{true: "Resolve", false: "Probe"}[isResolve], src.String())
