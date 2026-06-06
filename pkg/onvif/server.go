@@ -168,6 +168,7 @@ func (s *ONVIFServer) startSanitizingProxy(ctx context.Context, localIP string) 
 		// These need direct responses to avoid 400 errors
 		// Check raw body for GetSystemDateAndTime since normalization may not have completed
 		if strings.Contains(rawBody, "GetSystemDateAndTime") && !strings.Contains(rawBody, "<Category>") {
+			core.Logger.Info().Msg("ONVIF Proxy: Intercepting GetSystemDateAndTime - returning direct response")
 			respBody := buildSystemDateAndTimeResponse()
 			w.Header().Set("Content-Type", "application/soap+xml; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
