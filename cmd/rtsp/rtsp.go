@@ -51,6 +51,7 @@ func newStartCmd() *cobra.Command {
 	cmd.Flags().BoolP("daemon", "d", false, "Run as daemon (background)")
 	cmd.Flags().Bool("onvif", true, "Enable ONVIF Profiles bridge")
 	cmd.Flags().Int("onvif-port", 8080, "ONVIF server port")
+	cmd.Flags().String("onvif-ip", "", "Manually force the IP address advertised over ONVIF")
 
 	return cmd
 }
@@ -128,12 +129,13 @@ func runStartServer(cmd *cobra.Command, args []string) error {
 	// Start ONVIF Server if enabled
 	onvifEnabled, _ := cmd.Flags().GetBool("onvif")
 	onvifPort, _ := cmd.Flags().GetInt("onvif-port")
+	onvifIP, _ := cmd.Flags().GetString("onvif-ip")
 	
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	if onvifEnabled {
-		onvifSrv := onvif.NewONVIFServer(onvifPort, port, storageManager)
+		onvifSrv := onvif.NewONVIFServer(onvifPort, port, storageManager, onvifIP)
 		if err := onvifSrv.Start(ctx); err != nil {
 			core.Logger.Error().Err(err).Msg("Failed to start ONVIF sidecar service")
 		}

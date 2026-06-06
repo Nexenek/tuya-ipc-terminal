@@ -19,13 +19,15 @@ type ONVIFServer struct {
 	storageManager *storage.StorageManager
 	srvInstance    *onvifsrv.Server
 	cancelFunc     context.CancelFunc
+	overrideIP     string // Force a specific advertisement IP
 }
 
-func NewONVIFServer(port int, rtspPort int, sm *storage.StorageManager) *ONVIFServer {
+func NewONVIFServer(port int, rtspPort int, sm *storage.StorageManager, overrideIP string) *ONVIFServer {
 	return &ONVIFServer{
 		port:           port,
 		rtspPort:       rtspPort,
 		storageManager: sm,
+		overrideIP:     overrideIP,
 	}
 }
 
@@ -36,7 +38,10 @@ func (s *ONVIFServer) Start(ctx context.Context) error {
 	}
 
 	var profiles []onvifsrv.ProfileConfig
-	localIP := getLocalIP()
+	localIP := s.overrideIP
+	if localIP == "" {
+		localIP = getLocalIP()
+	}
 	core.Logger.Info().Msgf("ONVIF Local Network advertising address chosen: %s", localIP)
 
 	for idx, cam := range cameras {
@@ -257,12 +262,10 @@ func getLocalIP() string {
 		return "127.0.0.1"
 	}
 	
-	// STEP 1: Loop and target ONLY your real active physical IP range (192.168.1.x etc.)
 	for _, address := range addrs {
 		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ip := ipnet.IP.To4(); ip != nil {
 				ipStr := ip.String()
-				// Crucial Check: Ignore VirtualBox host-only default ranges (192.168.56.x)
 				if strings.HasPrefix(ipStr, "192.168.1.") || strings.HasPrefix(ipStr, "192.168.0.") || strings.HasPrefix(ipStr, "192.168.80.") {
 					return ipStr
 				}
@@ -270,7 +273,6 @@ func getLocalIP() string {
 		}
 	}
 	
-	// STEP 2: Fallback to general generic local home subnet matching while actively skipping the VirtualBox subnet
 	for _, address := range addrs {
 		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ip := ipnet.IP.To4(); ip != nil {
