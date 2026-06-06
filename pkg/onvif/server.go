@@ -3,7 +3,9 @@ package onvif
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"regexp"
 	"strings"
 	"syscall"
@@ -90,8 +92,8 @@ func (s *ONVIFServer) Start(ctx context.Context) error {
 	}
 
 	config := &onvifsrv.Config{
-		Host:     "0.0.0.0",
-		Port:     s.port,
+		Host:     "127.0.0.1", // Bind internally only so our proxy can sit on the external port!
+		Port:     8081,        // Runs internally
 		BasePath: "/onvif",
 		Timeout:  30 * time.Second,
 		Username: "admin",
@@ -124,17 +126,103 @@ func (s *ONVIFServer) Start(ctx context.Context) error {
 
 	s.srvInstance = srv
 
-	core.Logger.Info().Msgf("Starting ONVIF Host at http://0.0.0.0:%d/onvif/device_service", s.port)
+	core.Logger.Info().Msgf("Starting Internal ONVIF Engine at http://127.0.0.1:8081/onvif/device_service")
 	go func() {
 		if err := srv.Start(ctx); err != nil {
-			core.Logger.Error().Err(err).Msg("ONVIF Daemon closed")
+			core.Logger.Error().Err(err).Msg("Internal ONVIF Engine closed")
 		}
 	}()
+
+	// Spawn our custom SOAP Sanitizer/Logger Proxy on Port 80 (or s.port)
+	go s.startSanitizingProxy(ctx, localIP)
 
 	// Spawn our multi-interface WS-Discovery responder!
 	go s.startWSDiscovery(ctx, localIP)
 
 	return nil
+}
+
+func (s *ONVIFServer) startSanitizingProxy(ctx context.Context, localIP string) {
+	proxyAddr := fmt.Sprintf("0.0.0.0:%d", s.port)
+	core.Logger.Info().Msgf("Starting ONVIF Sanitizing Proxy on http://%s%s/device_service", proxyAddr, "/onvif")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Read raw request body to log strict mismatches
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+			return
+		}
+		rawBody := string(bodyBytes)
+
+		core.Logger.Info().Msgf("ONVIF Proxy: Received POST %s from %s", r.URL.Path, r.RemoteAddr)
+		core.Logger.Debug().Msgf("ONVIF Proxy: Raw request headers: %v", r.Header)
+		core.Logger.Debug().Msgf("ONVIF Proxy: Raw XML envelope:\n%s", rawBody)
+
+		// Create target request to internal ONVIF server
+		targetURL := fmt.Sprintf("http://127.0.0.1:8081%s", r.URL.Path)
+		req, err := http.NewRequest("POST", targetURL, strings.NewReader(rawBody))
+		if err != nil {
+			http.Error(w, "Failed to create forward request", http.StatusInternalServerError)
+			return
+		}
+
+		// Clean up and forward headers
+		for k, vv := range r.Header {
+			for _, v := range vv {
+				req.Header.Add(k, v)
+			}
+		}
+
+		// Normalize Content-Type and SOAP action headers which legacy devices mismatch
+		contentType := r.Header.Get("Content-Type")
+		if contentType == "" {
+			req.Header.Set("Content-Type", "application/soap+xml; charset=utf-8")
+		} else if !strings.Contains(contentType, "charset") {
+			req.Header.Set("Content-Type", contentType+"; charset=utf-8")
+		}
+
+		// Ensure SOAPAction is present if matching ver10 specs
+		if r.Header.Get("SOAPAction") == "" && strings.Contains(rawBody, "GetSystemDateAndTime") {
+			req.Header.Set("SOAPAction", "http://www.onvif.org/ver10/device/wsdl/GetSystemDateAndTime")
+		}
+
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			core.Logger.Error().Err(err).Msgf("ONVIF Proxy: Forward request failed")
+			http.Error(w, "Engine unreachable", http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		respBody, _ := io.ReadAll(resp.Body)
+		core.Logger.Info().Msgf("ONVIF Proxy: Forward responded %s with body size %d", resp.Status, len(respBody))
+
+		// Copy response headers and body back to client
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(respBody)
+	})
+
+	server := &http.Server{
+		Addr:    proxyAddr,
+		Handler: mux,
+	}
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			core.Logger.Error().Err(err).Msg("ONVIF Sanitizing Proxy closed unexpectedly")
+		}
+	}()
+
+	<-ctx.Done()
+	_ = server.Shutdown(context.Background())
 }
 
 func (s *ONVIFServer) startWSDiscovery(ctx context.Context, localIP string) {
