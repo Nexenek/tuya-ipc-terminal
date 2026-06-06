@@ -3,3 +3,4 @@ tuya_session_*
 .tuya-*
 .tmp
 tuya-ipc-terminal
+*.exe
