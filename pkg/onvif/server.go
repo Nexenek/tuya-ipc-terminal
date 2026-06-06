@@ -450,14 +450,16 @@ func normalizeSOAPEnvelope(xmlData string) string {
 	xmlData = strings.ReplaceAll(xmlData, "wsu:", "")
 
 	// 3. Fix Go's strict unmarshalling expected elements for namespace definitions!
-	// If a tag is like '<GetSystemDateAndTime xmlns="..."', Go's strict structure unmarshaller
-	// expects '<tds:GetSystemDateAndTime' or '<GetSystemDateAndTime xmlns="http://www.onvif.org/ver10/device/wsdl">' precisely.
-	// Since legacy clients send raw child namespace tags, we can force the correct XML namespace decoration
-	// on the standard known root message tags before they hit the unmarshaller:
-	xmlData = strings.ReplaceAll(xmlData, "<GetSystemDateAndTime>", "<GetSystemDateAndTime xmlns=\"http://www.onvif.org/ver10/device/wsdl\">")
-	xmlData = strings.ReplaceAll(xmlData, "<GetCapabilities>", "<GetCapabilities xmlns=\"http://www.onvif.org/ver10/device/wsdl\">")
-	xmlData = strings.ReplaceAll(xmlData, "<GetProfiles>", "<GetProfiles xmlns=\"http://www.onvif.org/ver10/media/wsdl\">")
-	xmlData = strings.ReplaceAll(xmlData, "<GetStreamURI>", "<GetStreamURI xmlns=\"http://www.onvif.org/ver10/media/wsdl\">")
+	// Some legacy gSOAP devices push local xmlns attributes on core action tags inside the body, e.g.:
+	// '<GetSystemDateAndTime xmlns="http://www.onvif.org/ver10/device/wsdl">'
+	// This namespace redeclaring inside the SOAP Body forces Go's xml.Unmarshal to fail due to context resets.
+	// We dynamically strip those localized xmlns declarations on the body tags to let them unmarshal cleanly!
+	xmlData = strings.ReplaceAll(xmlData, " xmlns=\"http://www.onvif.org/ver10/device/wsdl\"", "")
+	xmlData = strings.ReplaceAll(xmlData, " xmlns=\"http://www.onvif.org/ver10/media/wsdl\"", "")
+	
+	// Also ensure known tags are cleansed of any trailing nested attributes that reset parsing
+	xmlData = strings.ReplaceAll(xmlData, "<GetSystemDateAndTime>", "<GetSystemDateAndTime>")
+	xmlData = strings.ReplaceAll(xmlData, "<GetCapabilities>", "<GetCapabilities>")
 	
 	return xmlData
 }
